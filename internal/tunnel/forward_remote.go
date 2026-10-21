@@ -3,6 +3,7 @@ package tunnel
 import (
 	"fmt"
 	"net"
+	"strconv"
 
 	"ssh-tunnel/internal/config"
 	"golang.org/x/crypto/ssh"
@@ -19,9 +20,13 @@ func (t *Tunnel) startRemote(client *ssh.Client, f config.Forward) error {
 	if target == "" {
 		return fmt.Errorf("本地目标地址为空")
 	}
-	// 规范化 target 为 host:port
+	// 规范化 target 为 host:port。只把「纯端口」当作简写补上 localhost，
+	// 其余（如裸 IPv6 "::1"）直接报错，避免拼出 localhost:::1 这种非法地址。
 	if _, _, err := net.SplitHostPort(target); err != nil {
-		target = "localhost:" + target
+		if _, perr := strconv.Atoi(target); perr != nil {
+			return fmt.Errorf("目标地址 %q 缺少端口，应为 host:port", target)
+		}
+		target = net.JoinHostPort("localhost", target)
 	}
 
 	ln, err := client.Listen("tcp", listen)
