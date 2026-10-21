@@ -15,6 +15,13 @@ Thumbs.db
 *.swp
 *.swo
 
+# AI 工具的私有运行时目录（项目记忆统一放 .memory/，见 AGENTS.md）
+.workbuddy/
+.workbuddy-ai/
+.cursor/
+.claude/
+.codex/
+
 # Go
 *.test
 *.out
