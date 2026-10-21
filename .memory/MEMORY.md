@@ -64,6 +64,12 @@ wails build -clean -ldflags "-X main.Version=v1.0.0"
 8. **固定表头 + 独立滚动区**：`.thead` 和 `.tbody` 共用一套 grid 列宽时，经典滚动条会占掉
    tbody 的内容宽度，表头不让位就会逐列错开（1fr 列先吃，定宽列整体左移）。
    用 `offsetWidth - clientWidth` 量出宽度补到表头 `padding-right`，并挂 `ResizeObserver`。
+9. **速率断言不要依赖采样间隔**：`UpRate` 是「每秒字节数」，两次 `Sample()` 之间的耗时
+   直接决定数值大小（间隔 1s 才等于增量）。断言「速率 >= N 字节」会假失败：
+   - 间隔 > 1s 时算出的速率**小于**增量；
+   - 间隔恰好 0 时（Windows 墙上时钟粒度约 15.6ms，密集采样很容易撞上）速率**直接归零**。
+   要断言就用 `sampleAt` 显式给时刻，或只断言 `> 0`。集成测试里要测速率，
+   必须先 `time.Sleep` 出一个可测的间隔（见 `conn_tracking_test.go` 的 100ms）。
 
 ## 发布
 
@@ -75,14 +81,54 @@ git push origin v0.0.2                      # 只有推 tag 才会触发 Release
 
 - `release.yml` 两个触发：`push: tags: v*` 走完整发布；`workflow_dispatch` 只构建、版本号是 `dev`。
 - 重发同一版本必须先删 GitHub Release → `git push origin :v0.0.2` → 重打，直接 force-push tag 会撞「Release already exists」。
-- **NSIS 安装包在 CI 上从未产出过**（v0.0.1 / v0.0.2 的 assets 里都没有 `*-installer.exe`）。
-  根因已定位到 wails 源码 `pkg/commands/build/nsis_installer.go`：`makensis` 不在 PATH 时它只
+- **NSIS 安装包缺口已闭合**（v0.0.1 的 assets 里没有 `*-installer.exe`）。
+  根因在 wails 源码 `pkg/commands/build/nsis_installer.go`：`makensis` 不在 PATH 时它只
   `Println("Warning: Cannot create installer: makensis not found")` 然后 `return nil`，
   构建照常成功。所以 `Rename NSIS installer` 的 `nullglob` 兜底也永远走空、job 全绿。
-  Release Note 的下载表格里仍宣传了安装包，属于已知不一致。
   修法（已落地在 `release.yml`）：Windows job 里 `choco install nsis -y` 并把
-  `C:\Program Files (x86)\NSIS` 加进 `GITHUB_PATH`；同时把 rename 步骤的「警告并继续」
-  改成 `exit 1`，避免下次又静默发版。
+  `C:\Program Files (x86)\NSIS` 加进 `GITHUB_PATH`（同一步要用全路径自检，`GITHUB_PATH`
+  只对后续步骤生效）；同时把 rename 步骤的「警告并继续」改成 `exit 1`。
+  v0.0.2 第二次发布已产出 `ssh-tunnel-v0.0.2-windows-amd64-installer.exe`（6.51 MB）。
+
+## Windows CI：速率断言在 0 秒间隔上失败（已修）
+
+**现象**：`Test` 工作流在 windows-latest 上挂，run `39578629433`（commit `fa0f881`）。
+`Vet` 通过、`Test (race)` 被 skip、`go test -count=1 ./...` 退出码 1；macOS / Linux / 前端全绿。
+
+**根因**（真实日志，别再猜）：
+
+```
+--- FAIL: TestConnectionTracking (0.08s)
+conn_tracking_test.go:287: 活跃连接速率异常: upRate=0，期望 >= 4096
+```
+
+`upRate` 是**恰好 0**，不是偏小。`sampleAt` 里归零只有三条路径：首轮基准、
+`elapsed > maxSampleGap(3s)`、`elapsed <= 0`。测试总共 0.08 秒 → 只能是 `elapsed <= 0`。
+
+**为什么 elapsed 会是 0**：Windows 的墙上时钟（`time.Now().UnixNano()`）粒度约 **15.6ms**，
+而测试里两次 `reg.Sample()` 之间只隔一次 4KB 回环收发（几百微秒），很容易落在**同一个 tick**。
+改动前那句是 `e.rateUp.Store(u - e.lastUp.Swap(u))`，直接存增量、根本不看 elapsed，所以
+0 间隔也能过；加了 `elapsed <= 0` 的除零保护把它丢进归零分支后就挂了。
+生产侧只有 `app.go:170` 一处调用、1Hz ticker，**永远不会出现 0 间隔**，所以修的是测试不是代码。
+
+**修法**（`internal/tunnel/conn_tracking_test.go`）：两次采样之间 `time.Sleep(100 * time.Millisecond)`
+模拟 1Hz 节奏，让间隔在各平台都可测；断言改成 `UpRate > 0` + `Up >= len(big)`，
+不再钉具体数值——精确换算由 `internal/conn` 的 `TestRateNormalizedByElapsed` 用显式时刻覆盖。
+另加 `TestSampleSameInstantYieldsZeroRate` 把「0 间隔必须归零、不能除零崩」这个契约钉住。
+
+**排查经验**：
+- `actions/runs/{id}/jobs` 的 `steps[].started_at/completed_at` **匿名可读**，能直接拿到每步耗时。
+  这次就是靠「失败步骤 4.0s == 上次成功步骤 4.0s」先排除了「慢机器等满超时」这条错路。
+- job logs 接口匿名 403 `Must have admin rights`；`check-runs/{id}/annotations` 匿名可读
+  （但只有一句退出码）；网页 `.../job/{id}` 匿名 200 但日志登录后才异步加载。
+- **`test.yml` 已加 `Surface test failures` 步骤**：输出 tee 到 `test-output.txt`，
+  失败时把 `--- FAIL` / `panic:` / `_test.go:行号` 提取成一条 annotation。
+  annotation 匿名可读，以后 CI 挂了直接 `curl .../check-runs/{id}/annotations` 就能看到
+  是哪个测试、哪一行。**这是本项目排查 CI 失败的标准入口。**
+
+**副产品**：这次日志里 `conn_tracking_test.go:240: 进程识别成功: pid=9072 name="tunnel.test.exe"`
+说明 `internal/proc` 的 Windows 实现（`GetExtendedTcpTable` + `QueryFullProcessImageNameW`）
+**在运行时确实可用**，不再只有编译和 vet 证据。
 
 ## 约定
 

@@ -76,13 +76,41 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # 测试输出同时落一份到 test-output.txt，失败时由下面的 Surface test failures 转成
+      # annotation。原因：job logs 接口（actions/jobs/{id}/logs）即使对公开仓库也要求
+      # 仓库管理员权限，匿名只能看到 "Process completed with exit code 1"；
+      # 而 check-run 的 annotation 是公开可读的，排查时不用再找人要权限。
       - name: Test (race)
         if: matrix.race
-        run: go test -race -count=1 ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 ./... 2>&1 | tee test-output.txt
 
       - name: Test
         if: ${{ !matrix.race }}
-        run: go test -count=1 ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -count=1 ./... 2>&1 | tee test-output.txt
+
+      # 失败时把 --- FAIL / panic / 断言行提取出来挂成一条 annotation。
+      # 提取不到（比如编译期就挂了）就退回输出末尾 40 行，保证总有东西可看。
+      - name: Surface test failures
+        if: failure()
+        shell: bash
+        run: |
+          if [ ! -s test-output.txt ]; then
+            echo "::error title=${{ matrix.os }} 测试未产出输出::测试步骤可能没跑起来"
+            exit 0
+          fi
+          detail=$(grep -E '^(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' test-output.txt | head -40 || true)
+          if [ -z "$detail" ]; then
+            detail=$(tail -40 test-output.txt)
+          fi
+          # annotation 正文不支持裸换行，用 %0A 转义；% 本身要先转义成 %25
+          body=$(printf '%s' "$detail" | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+          echo "::error title=${{ matrix.os }} go test 失败::$body"
 
       - name: Build
         run: go build ./...
