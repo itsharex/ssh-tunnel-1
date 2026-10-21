@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"ssh-tunnel/internal/config"
@@ -31,6 +32,10 @@ var (
 	appInstance  *App
 	wailsCtx     context.Context
 	trayInstance *tray.Tray
+	// quitting 标记用户主动退出。OnBeforeClose 在「最小化到托盘」模式下会
+	// 拦截关闭请求，若不区分主动退出，QuitApp 会被自己拦住：
+	// 窗口隐藏、托盘已销毁、进程却还在跑（僵尸进程）。
+	quitting atomic.Bool
 )
 
 func main() {
@@ -63,6 +68,8 @@ func main() {
 	})
 	// 完全退出：停隧道 + 退托盘 + 退 Wails
 	appInstance.setQuitApp(func() {
+		// 先置位再走关闭流程，否则 OnBeforeClose 会把这次退出当成「关窗口」拦下来
+		quitting.Store(true)
 		manager.StopAll()
 		if trayInstance != nil {
 			trayInstance.Quit()
@@ -134,6 +141,10 @@ func main() {
 			}
 		},
 		OnBeforeClose: func(ctx context.Context) (prevent bool) {
+			// 主动退出（菜单/托盘/设置页的「退出程序」）时不再拦截
+			if quitting.Load() {
+				return false
+			}
 			// 关闭窗口时隐藏到托盘而非退出
 			settings := store.GetSettings()
 			if settings.MinimizeToTray && trayInstance != nil {
