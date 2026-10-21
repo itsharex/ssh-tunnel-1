@@ -3,6 +3,8 @@ import {computed, ref} from 'vue'
 import {useTunnelStore, type Tunnel} from '../stores/tunnel'
 import {useRouter} from 'vue-router'
 import * as App from '../../wailsjs/go/main/App'
+import {copyText} from '../lib/clipboard'
+import {confirmDialog, showError} from '../lib/dialog'
 
 const store = useTunnelStore()
 const router = useRouter()
@@ -37,7 +39,7 @@ async function toggle(t: Tunnel) {
     if (running) await store.stop(t.id)
     else await store.start(t.id)
   } catch (e: any) {
-    alert((e?.message || String(e)))
+    showError('', e)
   } finally {
     busy.value = ''
   }
@@ -45,11 +47,16 @@ async function toggle(t: Tunnel) {
 
 async function remove(t: Tunnel) {
   const name = t.name || `${t.user}@${t.host}`
-  if (!window.confirm(`确定删除隧道「${name}」？删除后无法恢复。`)) return
+  const ok = await confirmDialog(`确定删除隧道「${name}」？删除后无法恢复。`, {
+    title: '删除隧道',
+    okText: '删除',
+    danger: true,
+  })
+  if (!ok) return
   try {
     await store.remove(t.id)
   } catch (e: any) {
-    alert('删除失败: ' + (e?.message || String(e)))
+    showError('删除失败: ', e)
   }
 }
 
@@ -64,14 +71,15 @@ async function exportSsh(t: Tunnel) {
   try {
     exportCmd.value = await App.ToSSHCommandByID(t.id)
   } catch (e: any) {
-    alert('导出失败: ' + (e?.message || String(e)))
+    showError('导出失败: ', e)
   } finally {
     exporting.value = ''
   }
 }
 
 async function copyCmd() {
-  await navigator.clipboard.writeText(exportCmd.value)
+  const ok = await copyText(exportCmd.value)
+  if (!ok) showError('复制失败: ', new Error('剪贴板不可用'))
 }
 
 async function startAll() {
@@ -80,7 +88,7 @@ async function startAll() {
   try {
     await App.TunnelStartAll()
   } catch (e: any) {
-    alert((e?.message || String(e)))
+    showError('', e)
   } finally {
     busy.value = ''
   }
@@ -92,7 +100,7 @@ async function stopAll() {
   try {
     await App.TunnelStopAll()
   } catch (e: any) {
-    alert((e?.message || String(e)))
+    showError('', e)
   } finally {
     busy.value = ''
   }
@@ -109,7 +117,7 @@ const anyActive = computed(() =>
     <div class="actions">
       <button @click="startAll" :disabled="busy === 'all' || list.length === 0">全部启用</button>
       <button @click="stopAll" :disabled="busy === 'all' || !anyActive">全部关闭</button>
-      <router-link to="/import"><button>导入</button></router-link>
+      <router-link to="/import"><button>导入导出</button></router-link>
       <router-link to="/edit"><button class="primary">+ 新建隧道</button></router-link>
     </div>
   </div>

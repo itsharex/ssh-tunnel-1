@@ -3,6 +3,7 @@ import {onMounted, onUnmounted} from 'vue'
 import {useTunnelStore} from './stores/tunnel'
 import {EventsOn, EventsOff} from '../wailsjs/runtime/runtime'
 import * as App from '../wailsjs/go/main/App'
+import DialogHost from './components/DialogHost.vue'
 
 const store = useTunnelStore()
 
@@ -29,7 +30,7 @@ async function quitApp() {
       <nav>
         <router-link to="/">隧道列表</router-link>
         <router-link to="/edit">新建隧道</router-link>
-        <router-link to="/import">导入</router-link>
+        <router-link to="/import">导入导出</router-link>
         <router-link to="/settings">设置</router-link>
       </nav>
       <div class="spacer"></div>
@@ -41,5 +42,6 @@ async function quitApp() {
     <main class="main">
       <router-view />
     </main>
+    <DialogHost />
   </div>
 </template>

@@ -4,6 +4,7 @@ import {useRoute, useRouter} from 'vue-router'
 import {useTunnelStore, type Tunnel} from '../stores/tunnel'
 import * as App from '../../wailsjs/go/main/App'
 import {config} from '../../wailsjs/go/models'
+import {showAlert, showError} from '../lib/dialog'
 
 const route = useRoute()
 const router = useRouter()
@@ -62,18 +63,18 @@ function delForward(i: number) {
 
 async function save() {
   if (!t.value.host || !t.value.user) {
-    alert('请填写主机和用户')
+    await showAlert('请填写主机和用户', '信息不完整')
     return
   }
   if (!t.value.forwards?.length) {
-    alert('请至少添加一条转发规则')
+    await showAlert('请至少添加一条转发规则', '信息不完整')
     return
   }
   try {
     await store.save(t.value)
     router.push('/')
   } catch (e: any) {
-    alert('保存失败: ' + (e?.message || String(e)))
+    showError('保存失败: ', e)
   }
 }
 

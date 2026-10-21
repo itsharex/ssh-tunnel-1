@@ -4,6 +4,8 @@ import {useRouter} from 'vue-router'
 import * as App from '../../wailsjs/go/main/App'
 import {config} from '../../wailsjs/go/models'
 import {useTunnelStore} from '../stores/tunnel'
+import {copyText} from '../lib/clipboard'
+import {showError} from '../lib/dialog'
 
 const router = useRouter()
 const store = useTunnelStore()
@@ -72,7 +74,8 @@ async function loadExportList() {
 }
 
 async function copy(text: string) {
-  await navigator.clipboard.writeText(text)
+  const ok = await copyText(text)
+  if (!ok) showError('复制失败: ', new Error('剪贴板不可用'))
 }
 
 function forwardText(f: any) {
@@ -84,7 +87,7 @@ function forwardText(f: any) {
 
 <template>
   <div class="page-title">
-    <h2>导入 / 导出</h2>
+    <h2>导入导出</h2>
   </div>
 
   <div class="card">
