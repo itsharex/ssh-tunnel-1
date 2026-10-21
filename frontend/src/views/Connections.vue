@@ -36,6 +36,7 @@ const tick = ref(Date.now())
 const scrollEl = ref<HTMLElement | null>(null)
 const scrollTop = ref(0)
 const viewH = ref(360)
+const sbw = ref(0) // 滚动条占用的宽度，表头要跟着让位
 
 const filtered = computed(() => {
   const kw = keyword.value.trim().toLowerCase()
@@ -48,12 +49,84 @@ const filtered = computed(() => {
   })
 })
 
-const totalH = computed(() => filtered.value.length * ROW_H)
+type SortKey = 'proc' | 'dst' | 'traffic' | 'rate' | 'dur'
+
+// 默认不排序：null 表示保持后端快照的原始顺序（最新的在前）。
+const sortKey = ref<SortKey | null>(null)
+const sortDir = ref<1 | -1>(1)
+
+// numeric: true 让 10.0.0.9 排在 10.0.0.10 前面；不缓存实例的话
+// 每次比较都 new 一个 Collator，4096 行会直接卡住。
+const collator = new Intl.Collator(undefined, {numeric: true, sensitivity: 'base'})
+
+function sortValue(c: ConnSnapshot, key: SortKey, now: number): number | string {
+  switch (key) {
+    case 'proc': return procLabel(c)
+    case 'dst': return c.dst || ''
+    // 流量 / 速率是上下两行，按合计排更符合「谁用得最多」的直觉
+    case 'traffic': return c.up + c.down
+    case 'rate': return c.upRate + c.downRate
+    // 已关闭的用固定时长，活跃的随 tick 增长；两者放在一起比才有意义
+    case 'dur': return (c.state === 'closed' && c.closedAt ? c.closedAt : now) - c.started
+  }
+}
+
+// 排序结果。放在 computed 里，所以每次推送（rows 变化）都会按当前列重排，
+// 不需要额外监听——刷新后仍然是排好序的。
+const sorted = computed(() => {
+  const list = filtered.value
+  const key = sortKey.value
+  if (!key) return list
+
+  const dir = sortDir.value
+  // 只有按「时长」排时才依赖 tick：其它列的排序键与时间无关，
+  // 不读 tick 就不会每秒白白重排一次 4096 行。
+  const now = key === 'dur' ? tick.value : 0
+
+  // 先算一遍排序键，避免比较函数里反复取字段、反复算时长
+  const dec = list.map(c => ({c, v: sortValue(c, key, now)}))
+  dec.sort((a, b) => {
+    const r = typeof a.v === 'number' && typeof b.v === 'number'
+      ? a.v - b.v
+      : collator.compare(String(a.v), String(b.v))
+    // sort 是稳定的：键相同保持原顺序，不会每秒乱跳
+    return r * dir
+  })
+  return dec.map(d => d.c)
+})
+
+// 数值列先看大的，文本列先按字典序
+function defaultDir(key: SortKey): 1 | -1 {
+  return key === 'traffic' || key === 'rate' || key === 'dur' ? -1 : 1
+}
+
+// 点表头：换列 → 用该列的默认方向；同列再点 → 反向；第三次 → 取消排序回到默认
+function toggleSort(key: SortKey) {
+  if (sortKey.value !== key) {
+    sortKey.value = key
+    sortDir.value = defaultDir(key)
+  } else if (sortDir.value === defaultDir(key)) {
+    sortDir.value = defaultDir(key) === 1 ? -1 : 1
+  } else {
+    sortKey.value = null
+    sortDir.value = 1
+  }
+  // 换了顺序，原来的滚动位置指向的是别的行了
+  scrollTop.value = 0
+  if (scrollEl.value) scrollEl.value.scrollTop = 0
+}
+
+function sortMark(key: SortKey) {
+  if (sortKey.value !== key) return ''
+  return sortDir.value === 1 ? '▲' : '▼'
+}
+
+const totalH = computed(() => sorted.value.length * ROW_H)
 const startIdx = computed(() => Math.max(0, Math.floor(scrollTop.value / ROW_H) - OVERSCAN))
 const endIdx = computed(() =>
-  Math.min(filtered.value.length, Math.ceil((scrollTop.value + viewH.value) / ROW_H) + OVERSCAN)
+  Math.min(sorted.value.length, Math.ceil((scrollTop.value + viewH.value) / ROW_H) + OVERSCAN)
 )
-const visible = computed(() => filtered.value.slice(startIdx.value, endIdx.value))
+const visible = computed(() => sorted.value.slice(startIdx.value, endIdx.value))
 const offsetY = computed(() => startIdx.value * ROW_H)
 
 const activeCount = computed(() => rows.value.filter(c => c.state === 'active').length)
@@ -112,6 +185,7 @@ function onUpdate(list: ConnSnapshot[]) {
 // 看门狗：万一「离开页面」的停止指令比「进入页面」的启动指令更晚到达后端，
 // 推送会意外停住。超过 2.5s 没收到更新就重启一次推送。
 let watchdog: number | undefined
+let ro: ResizeObserver | undefined
 let mounted = false
 function armWatchdog() {
   window.clearTimeout(watchdog)
@@ -134,7 +208,13 @@ function armWatchdog() {
 }
 
 function measure() {
-  if (scrollEl.value) viewH.value = scrollEl.value.clientHeight
+  const el = scrollEl.value
+  if (!el) return
+  viewH.value = el.clientHeight
+  // 经典滚动条（Linux 的 WebKitGTK、旧版 WebView2、macOS 设了「始终显示滚动条」）
+  // 会占掉 tbody 的内容宽度，而表头不在同一个滚动容器里。
+  // 不让出同样的宽度，每一列都会错开一条滚动条——1fr 列先吃掉一点，定宽列整体左移。
+  sbw.value = el.offsetWidth - el.clientWidth
 }
 
 function onScroll() {
@@ -192,6 +272,10 @@ onMounted(async () => {
   armWatchdog()
   measure()
   window.addEventListener('resize', measure)
+  // 列表从空到撑出滚动条（或反过来）时 clientWidth 会变，
+  // 表头的让位宽度得跟着更新，否则一开始对齐、来了数据就错开。
+  ro = new ResizeObserver(measure)
+  if (scrollEl.value) ro.observe(scrollEl.value)
 })
 
 onUnmounted(() => {
@@ -200,6 +284,8 @@ onUnmounted(() => {
   EventsOff('conn:update')
   void App.ConnWatch(false)
   window.removeEventListener('resize', measure)
+  ro?.disconnect()
+  ro = undefined
 })
 </script>
 
@@ -242,18 +328,29 @@ onUnmounted(() => {
     </div>
 
     <div class="table">
-      <div class="thead">
+      <!-- paddingRight 补上滚动条占掉的宽度，让表头与行共用同一条内容宽度 -->
+      <div class="thead" :style="{paddingRight: 12 + sbw + 'px'}">
         <span></span>
-        <span>进程 / 来源</span>
-        <span>目标 / 隧道</span>
-        <span>流量</span>
-        <span>速率</span>
-        <span>时长</span>
+        <button class="th" :class="{on: sortKey === 'proc'}" @click="toggleSort('proc')">
+          进程 / 来源<i class="mark">{{ sortMark('proc') }}</i>
+        </button>
+        <button class="th" :class="{on: sortKey === 'dst'}" @click="toggleSort('dst')">
+          目标 / 隧道<i class="mark">{{ sortMark('dst') }}</i>
+        </button>
+        <button class="th num" :class="{on: sortKey === 'traffic'}" @click="toggleSort('traffic')">
+          流量<i class="mark">{{ sortMark('traffic') }}</i>
+        </button>
+        <button class="th num" :class="{on: sortKey === 'rate'}" @click="toggleSort('rate')">
+          速率<i class="mark">{{ sortMark('rate') }}</i>
+        </button>
+        <button class="th num" :class="{on: sortKey === 'dur'}" @click="toggleSort('dur')">
+          时长<i class="mark">{{ sortMark('dur') }}</i>
+        </button>
         <span></span>
       </div>
 
       <div ref="scrollEl" class="tbody" @scroll="onScroll">
-        <div v-if="filtered.length === 0" class="empty-hint">
+        <div v-if="sorted.length === 0" class="empty-hint">
           {{ rows.length === 0 ? '当前没有连接。启动隧道并产生流量后会显示在这里。' : '没有匹配的连接' }}
         </div>
         <div v-else :style="{height: totalH + 'px', position: 'relative'}">
@@ -348,6 +445,31 @@ onUnmounted(() => {
   height: 32px; font-size: 12px; color: var(--muted);
   border-bottom: 1px solid var(--border); background: #fafbfc; flex: none;
 }
+
+/* 表头是可点的排序按钮。数值列必须和数据单元格一样右对齐，
+   否则「流量」「速率」贴在列左边、数字贴在列右边，中间差一整列宽。 */
+.th {
+  width: 100%; height: 100%; min-width: 0;
+  display: flex; align-items: center; justify-content: flex-start;
+  padding: 0; border: 0; background: transparent;
+  font: inherit; font-size: 12px; color: var(--muted);
+  border-radius: 4px; cursor: pointer;
+  /* 全局 button:hover 会抬 1px、染蓝边，表头不要这些 */
+  transform: none;
+}
+.th:hover {color: var(--text); background: var(--bg); border-color: transparent; transform: none;}
+.th.num {justify-content: flex-end;}
+.th.on {color: var(--text); font-weight: 500;}
+
+/* 箭头始终占位（宽 9px），切换排序时表头文字不会左右抖 */
+.th .mark {
+  flex: none; width: 9px; margin-left: 4px;
+  font-size: 9px; font-style: normal;
+  opacity: 0; transition: opacity var(--transition);
+}
+.th.on .mark {opacity: 1;}
+/* 右对齐的列把箭头放到文字左边，文字的右边缘才能和数字的右边缘对齐 */
+.th.num .mark {order: -1; margin-left: 0; margin-right: 4px;}
 .tbody {
   flex: 1;
   /* flex 子项默认 min-height:auto，不会收缩到内容高度以下，
@@ -374,7 +496,11 @@ onUnmounted(() => {
 .cell.num {align-items: flex-end; text-align: right; font-variant-numeric: tabular-nums;}
 .cell .up {color: var(--primary);}
 .cell .down {color: var(--success);}
-.cell.dur {font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums;}
+.cell.dur {
+  font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums;
+  /* 与表头一致：时长也是数值列，右对齐后数字末尾对齐，扫视更快 */
+  text-align: right; white-space: nowrap;
+}
 .cell.act {align-items: flex-end;}
 .cell.act button {padding: 2px 6px; font-size: 12px;}
 .mono {font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;}
