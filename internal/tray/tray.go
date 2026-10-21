@@ -35,6 +35,9 @@ type Tray struct {
 	ready     bool
 	startFn   func()
 	endFn     func()
+	// done 是「当前这一代菜单」的关闭信号。每次 rebuild 都会关闭旧的、
+	// 换一个新的，用来回收上一代菜单项上的点击监听 goroutine。
+	done chan struct{}
 }
 
 // New 创建托盘实例。调用 Init 注册到 systray（不阻塞）。
@@ -87,9 +90,7 @@ func (t *Tray) SetTunnelState(id, status, lastErr string) {
 	for i := range t.items {
 		if t.items[i].ID == id {
 			t.items[i].Status = status
-			if lastErr != "" || status == "running" || status == "connecting" {
-				t.items[i].Error = lastErr
-			}
+			t.items[i].Error = lastErr
 		}
 	}
 	mi, ok := t.menuItems[id]
@@ -174,6 +175,13 @@ func (t *Tray) refreshIcon() {
 // rebuild 重建整个菜单。必须在 systray ready 后调用。
 func (t *Tray) rebuild() {
 	t.mu.Lock()
+	// ResetMenu 会丢弃旧的 MenuItem，但它们的 ClickedCh 不会关闭，
+	// 不主动发信号回收就会每重建一次泄漏一批阻塞的 goroutine。
+	if t.done != nil {
+		close(t.done)
+	}
+	t.done = make(chan struct{})
+	done := t.done
 	t.menuItems = make(map[string]*systray.MenuItem)
 	items := make([]TunnelItem, len(t.items))
 	copy(items, t.items)
@@ -194,58 +202,61 @@ func (t *Tray) rebuild() {
 			t.mu.Lock()
 			t.menuItems[it.ID] = mi
 			t.mu.Unlock()
-			go t.watchToggle(mi, it.ID, cbs)
+			go t.watchToggle(mi, it.ID, cbs, done)
 		}
 		systray.AddSeparator()
 
 		// 全部启用 / 全部关闭
 		startAll := systray.AddMenuItem("全部启用", "启动所有隧道")
-		go func() {
-			for range startAll.ClickedCh {
-				if cbs.OnStartAll != nil {
-					cbs.OnStartAll()
-				}
+		go watchClick(startAll, done, func() {
+			if cbs.OnStartAll != nil {
+				cbs.OnStartAll()
 			}
-		}()
+		})
 		stopAll := systray.AddMenuItem("全部关闭", "停止所有隧道")
-		go func() {
-			for range stopAll.ClickedCh {
-				if cbs.OnStopAll != nil {
-					cbs.OnStopAll()
-				}
+		go watchClick(stopAll, done, func() {
+			if cbs.OnStopAll != nil {
+				cbs.OnStopAll()
 			}
-		}()
+		})
 		systray.AddSeparator()
 	}
 
 	show := systray.AddMenuItem("显示窗口", "显示主窗口")
-	go func() {
-		for range show.ClickedCh {
-			if cbs.OnShowWindow != nil {
-				cbs.OnShowWindow()
-			}
+	go watchClick(show, done, func() {
+		if cbs.OnShowWindow != nil {
+			cbs.OnShowWindow()
 		}
-	}()
+	})
 
 	quit := systray.AddMenuItem("退出", "退出程序")
-	go func() {
-		for range quit.ClickedCh {
-			if cbs.OnQuit != nil {
-				cbs.OnQuit()
-			}
-			systray.Quit()
+	go watchClick(quit, done, func() {
+		if cbs.OnQuit != nil {
+			cbs.OnQuit()
 		}
-	}()
+		systray.Quit()
+	})
 }
 
-func (t *Tray) watchToggle(mi *systray.MenuItem, id string, cbs Callbacks) {
+// watchClick 监听菜单项点击，直到该代菜单被重建（done 关闭）为止。
+func watchClick(mi *systray.MenuItem, done <-chan struct{}, fn func()) {
 	for {
-		_, ok := <-mi.ClickedCh
-		if !ok {
+		select {
+		case <-done:
 			return
+		case _, ok := <-mi.ClickedCh:
+			if !ok {
+				return
+			}
+			fn()
 		}
+	}
+}
+
+func (t *Tray) watchToggle(mi *systray.MenuItem, id string, cbs Callbacks, done <-chan struct{}) {
+	watchClick(mi, done, func() {
 		if cbs.OnToggleTunnel != nil {
 			cbs.OnToggleTunnel(id)
 		}
-	}
+	})
 }
