@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 
 	"ssh-tunnel/internal/config"
 	"golang.org/x/crypto/ssh"
@@ -64,10 +65,33 @@ func (t *Tunnel) handleLocalConn(client *ssh.Client, local net.Conn, target stri
 	pipe(local, remote)
 }
 
-// pipe 双向转发
+// pipe 双向转发，两个方向都结束后才返回。
+// 单个方向读到 EOF（对端半关闭写端）时，把 EOF 传播到另一侧的写方向，
+// 而不是直接整条断开；否则「先发请求、再半关闭、等服务端响应」的协议
+// 会在响应回来之前就被掐断。
 func pipe(a, b io.ReadWriteCloser) {
-	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(a, b); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(b, a); done <- struct{}{} }()
-	<-done
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(a, b)
+		closeWrite(a)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(b, a)
+		closeWrite(b)
+	}()
+	wg.Wait()
+}
+
+// closeWrite 尽力半关闭连接的写方向。*net.TCPConn 与 ssh 的 net.Conn 包装
+// 都实现了 CloseWrite；不支持时退化为整条关闭，避免调用方永久等待。
+func closeWrite(c io.ReadWriteCloser) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		if err := cw.CloseWrite(); err == nil {
+			return
+		}
+	}
+	_ = c.Close()
 }

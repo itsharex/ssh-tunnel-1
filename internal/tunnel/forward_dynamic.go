@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 
 	"ssh-tunnel/internal/config"
 	"golang.org/x/crypto/ssh"
@@ -201,11 +202,21 @@ func (t *Tunnel) handleHTTPProxy(client *ssh.Client, conn net.Conn, br *bufio.Re
 	}
 }
 
-// pipeConn 双向转发。客户端方向从 clientReader 读取（含 bufio 已缓冲的数据），
-// 回写走 clientConn。
+// pipeConn 双向转发，两个方向都结束后才返回。
+// 客户端方向从 clientReader 读取（含 bufio 已缓冲的数据），回写走 clientConn。
+// 单个方向结束时传播半关闭，避免另一方向的数据被提前掐断。
 func pipeConn(clientConn net.Conn, clientReader io.Reader, remote net.Conn) {
-	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(remote, clientReader); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(clientConn, remote); done <- struct{}{} }()
-	<-done
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(remote, clientReader)
+		closeWrite(remote)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(clientConn, remote)
+		closeWrite(clientConn)
+	}()
+	wg.Wait()
 }
