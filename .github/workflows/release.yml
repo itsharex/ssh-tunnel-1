@@ -96,6 +96,19 @@ jobs:
         if: runner.os == 'Linux'
         run: wails build -platform ${{ matrix.wails-platform }} -clean -ldflags "-X main.Version=${{ steps.ver.outputs.version }}" -o "${{ matrix.artifact }}"
 
+      # wails 的 -nsis 在找不到 makensis 时只打印一行警告就 `return nil`
+      # （pkg/commands/build/nsis_installer.go），构建照常成功、安装包静默缺失。
+      # windows-latest 没有预装 NSIS，必须自己装并把目录加进 PATH，
+      # 否则整条链路一路绿灯却永远出不了 installer。
+      - name: Install NSIS (Windows)
+        if: runner.os == 'Windows' && matrix.nsis == 'true'
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # 同一步里 PATH 还没生效，用全路径确认装好了
+          & "C:\Program Files (x86)\NSIS\makensis.exe" -VERSION
+
       - name: Build Wails app (Windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -107,7 +120,8 @@ jobs:
         run: wails build -platform ${{ matrix.wails-platform }} -clean -ldflags "-X main.Version=${{ steps.ver.outputs.version }}"
 
       # Windows：重命名 NSIS 安装包（project.nsi 固定输出 ssh-tunnel-<arch>-installer.exe）。
-      # installer 是附属产物，缺失不应阻断主程序发布；用 nullglob 容错并打印目录便于诊断。
+      # 找不到就报错退出：以前这里是「警告并继续」，结果安装包缺失也能一路绿灯发版，
+      # 而 Release Note 的下载表格里仍然宣传着安装包。
       - name: Rename NSIS installer (Windows)
         if: runner.os == 'Windows' && matrix.nsis == 'true'
         shell: bash
@@ -115,14 +129,14 @@ jobs:
           shopt -s nullglob
           installers=(build/bin/*-installer.exe)
           shopt -u nullglob
-          if [ "${#installers[@]}" -gt 0 ]; then
-            mv "${installers[0]}" "build/bin/${{ matrix.artifact }}-installer.exe"
-            echo "✅ installer 已重命名"
-          else
-            echo "⚠️ 未找到 NSIS installer（可能 runner 未预装 makensis 或 NSIS 跳过），仅发布免安装 exe"
+          if [ "${#installers[@]}" -eq 0 ]; then
+            echo "::error::未生成 NSIS 安装包。wails 在缺少 makensis 时会静默跳过，请检查 Install NSIS 步骤是否成功。"
             echo "--- build/bin 实际内容 ---"
             ls -la build/bin/ || true
+            exit 1
           fi
+          mv "${installers[0]}" "build/bin/${{ matrix.artifact }}-installer.exe"
+          echo "✅ installer 已重命名: ${{ matrix.artifact }}-installer.exe"
 
       # macOS：.app 打包成 zip（ditto 保留权限/结构），用规范名
       - name: Archive macOS app
