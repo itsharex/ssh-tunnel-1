@@ -44,6 +44,13 @@ wails build -clean -ldflags "-X main.Version=v1.0.0"
 - **配置落盘**：只有 `SaveTunnel` / `DeleteTunnel` / `SetSettings` / `ImportConfig` 会写盘，走 `Store.persist()`（`writeMu` 串行 + 临时文件 rename 原子替换）。
 - **停止语义**：`Tunnel.Stop()` 阻塞直到 `run()` 退出；`run()` 内部一律使用启动时捕获的局部 `stopCh`，不再读 `t.stopCh` 字段。
 - **托盘**：systray 用 `RunWithExternalLoop`，必须在 `wails.Run` 之前 `Init()` + `Start()`；菜单重建用「代际 done 通道」回收旧监听 goroutine。
+- **连接监控口径**：`up` = 客户端→目标，`down` = 目标→客户端；速率是**每秒字节数**，
+  `sampleAt` 按实际采样间隔换算（`delta * 1e9 / elapsed`），不是「每次采样的增量」——
+  推送循环间隔恒大于 1s，ticker 漏拍时直接拿增量当速率会翻倍虚高。
+- **`-D` 的 HTTP 代理不复用上游**：`handleHTTPProxy` 的 keep-alive 循环里每条请求都
+  `client.Dial` 一次（多付 SSH 通道建立 + 源站 TCP 握手各 1 RTT）。只有明文 HTTP 受影响，
+  HTTPS 走 CONNECT 是裸管道、本来就只有一条上游。2026-10-21 评估后决定暂不修（要处理
+  「复用连接已失效 → 重放」的正确性），细节见当日日志。
 
 ## 踩过的坑（改代码前务必看）
 
@@ -54,6 +61,28 @@ wails build -clean -ldflags "-X main.Version=v1.0.0"
 5. **keepalive**：`client.SendRequest(..., true, nil)` 在链路静默死亡时不会返回错误而是永久阻塞，必须自己加超时后 `client.Close()`。
 6. **路由复用**：`/edit/:id` 与 `/edit` 是同一条路由记录，组件会复用，表单初始化必须用 `watch(route.params.id)` 而不是只靠 `onMounted`。
 7. **Windows 文件替换**：`os.Rename` 覆盖已存在文件是支持的（`MOVEFILE_REPLACE_EXISTING`），但目标被杀毒/索引服务独占时会 access denied —— `store.persist` 已加 5 次短重试（`renameFile`）。
+8. **固定表头 + 独立滚动区**：`.thead` 和 `.tbody` 共用一套 grid 列宽时，经典滚动条会占掉
+   tbody 的内容宽度，表头不让位就会逐列错开（1fr 列先吃，定宽列整体左移）。
+   用 `offsetWidth - clientWidth` 量出宽度补到表头 `padding-right`，并挂 `ResizeObserver`。
+
+## 发布
+
+```bash
+git push origin main                        # 先推 commit，否则 tag 指向的提交不在远端
+git tag -a v0.0.2 -m "Release v0.0.2"       # annotated，与 v0.0.1 一致
+git push origin v0.0.2                      # 只有推 tag 才会触发 Release
+```
+
+- `release.yml` 两个触发：`push: tags: v*` 走完整发布；`workflow_dispatch` 只构建、版本号是 `dev`。
+- 重发同一版本必须先删 GitHub Release → `git push origin :v0.0.2` → 重打，直接 force-push tag 会撞「Release already exists」。
+- **NSIS 安装包在 CI 上从未产出过**（v0.0.1 / v0.0.2 的 assets 里都没有 `*-installer.exe`）。
+  根因已定位到 wails 源码 `pkg/commands/build/nsis_installer.go`：`makensis` 不在 PATH 时它只
+  `Println("Warning: Cannot create installer: makensis not found")` 然后 `return nil`，
+  构建照常成功。所以 `Rename NSIS installer` 的 `nullglob` 兜底也永远走空、job 全绿。
+  Release Note 的下载表格里仍宣传了安装包，属于已知不一致。
+  修法（已落地在 `release.yml`）：Windows job 里 `choco install nsis -y` 并把
+  `C:\Program Files (x86)\NSIS` 加进 `GITHUB_PATH`；同时把 rename 步骤的「警告并继续」
+  改成 `exit 1`，避免下次又静默发版。
 
 ## 约定
 
