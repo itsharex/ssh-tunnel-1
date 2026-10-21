@@ -210,6 +210,31 @@ func TestRateNormalizedByElapsed(t *testing.T) {
 	}
 }
 
+// TestSampleSameInstantYieldsZeroRate 两次采样落在同一时刻时，
+// 「每秒字节数」在 0 秒间隔上无定义：必须归零，既不能除零崩掉，
+// 也不能把这一轮的增量当成速率。Windows 的墙上时钟粒度约 15ms，
+// 密集采样很容易撞上这种情况（真实的 1Hz 推送不会）。
+func TestSampleSameInstantYieldsZeroRate(t *testing.T) {
+	e := NewEntry("c1", "t1", "隧道", "L :1", "TCP", "127.0.0.1:1", "a:1")
+	rc := e.Wrap(&fakeRW{})
+
+	t0 := time.Now()
+	e.sampleAt(t0) // 建立基准
+
+	_, _ = rc.Read(make([]byte, 4096))
+	e.sampleAt(t0) // 同一时刻再采一次
+	if e.rateUp.Load() != 0 {
+		t.Fatalf("0 秒间隔上速率应为 0，实际 %d", e.rateUp.Load())
+	}
+
+	// 不崩、也不卡死：下一轮有真实间隔后照常算出速率
+	_, _ = rc.Read(make([]byte, 100))
+	e.sampleAt(t0.Add(time.Second))
+	if e.rateUp.Load() != 100 {
+		t.Fatalf("恢复后速率应为 100 B/s，实际 %d", e.rateUp.Load())
+	}
+}
+
 // TestSampleResetsAfterLongGap 监控页关过一段时间再打开时，
 // 期间累计的字节不能被当成 1 秒的速率——那会在界面上蹦出一个虚高值。
 func TestSampleResetsAfterLongGap(t *testing.T) {

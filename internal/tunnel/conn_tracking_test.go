@@ -272,7 +272,7 @@ func TestConnectionTracking(t *testing.T) {
 	for i := 0; i < 100 && reg.Len() <= before; i++ {
 		time.Sleep(10 * time.Millisecond) // 等新连接登记完成
 	}
-	reg.Sample()
+	reg.Sample() // 建立基准
 
 	big := make([]byte, 4096)
 	if _, err := c2.Write(big); err != nil {
@@ -281,10 +281,26 @@ func TestConnectionTracking(t *testing.T) {
 	if _, err := io.ReadFull(c2, big); err != nil {
 		t.Fatalf("第二次读回显失败: %v", err)
 	}
+
+	// 两次采样之间必须隔开可观的时间。Windows 的墙上时钟粒度约 15ms，
+	// 而上面这 4KB 回环收发可能只要几百微秒，两次 time.Now() 很可能落在
+	// 同一个 tick 里 —— elapsed 就是 0，而「每秒字节数」在 0 秒间隔上无定义，
+	// sampleAt 只能按 0 处理。真实推送是 1Hz，不会出现这种情况。
+	time.Sleep(100 * time.Millisecond)
 	reg.Sample()
+
 	for _, s := range reg.Snapshot() {
-		if s.State == conn.StateActive && s.UpRate < int64(len(big)) {
-			t.Errorf("活跃连接速率异常: upRate=%d，期望 >= %d", s.UpRate, len(big))
+		if s.State != conn.StateActive {
+			continue
+		}
+		if s.Up < int64(len(big)) {
+			t.Errorf("上行字节计数偏小: up=%d，期望 >= %d", s.Up, len(big))
+		}
+		// 只断言「确实算出了非零速率」。具体换算（增量 ÷ 间隔）由 conn 包的
+		// TestRateNormalizedByElapsed 用显式时刻精确覆盖；这里再钉一个具体数值，
+		// 等于让集成测试重新依赖两次采样的实际间隔，又会变成时钟粒度敏感。
+		if s.UpRate <= 0 {
+			t.Errorf("活跃连接速率应大于 0（已写入 %d 字节）: upRate=%d", len(big), s.UpRate)
 		}
 	}
 }
