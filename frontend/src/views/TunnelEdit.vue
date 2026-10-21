@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import {ref, onMounted, computed} from 'vue'
+import {ref, onMounted, computed, watch} from 'vue'
 import {useRoute, useRouter} from 'vue-router'
 import {useTunnelStore, type Tunnel} from '../stores/tunnel'
 import * as App from '../../wailsjs/go/main/App'
@@ -9,35 +9,48 @@ const route = useRoute()
 const router = useRouter()
 const store = useTunnelStore()
 
-const t = ref<Tunnel>(new config.Tunnel({
-  name: '',
-  host: '',
-  port: 22,
-  user: '',
-  authType: 'key',
-  keyPath: '',
-  proxy: {type: '', host: '', port: 1080, user: '', password: ''},
-  forwards: [],
-  autoReconnect: true,
-  reconnectMinMs: 1000,
-  reconnectMaxMs: 30000,
-  serverAliveInterval: 30,
-}))
+function blankTunnel(): Tunnel {
+  return new config.Tunnel({
+    name: '',
+    host: '',
+    port: 22,
+    user: '',
+    authType: 'key',
+    keyPath: '',
+    proxy: {type: '', host: '', port: 1080, user: '', password: ''},
+    forwards: [],
+    autoReconnect: true,
+    reconnectMinMs: 1000,
+    reconnectMaxMs: 30000,
+    serverAliveInterval: 30,
+  })
+}
+
+const t = ref<Tunnel>(blankTunnel())
 
 const testing = ref(false)
 const testMsg = ref('')
 
-onMounted(async () => {
+async function loadTunnel() {
   const id = route.params.id as string | undefined
-  if (id) {
-    const found = await App.TunnelList().then(list => list.find(x => x.id === id))
-    if (found) t.value = found
+  testMsg.value = ''
+  if (!id) {
+    // 从「编辑」切到「新建」时要彻底重置，否则会带着上一条隧道的 ID 保存
+    t.value = blankTunnel()
+    return
   }
+  const found = await App.TunnelList().then(list => list.find(x => x.id === id))
+  t.value = found ?? blankTunnel()
   // 兼容旧配置：proxy 可能为 undefined，补默认对象避免绑定报错
   if (!t.value.proxy) {
     t.value.proxy = new config.Proxy({type: '', host: '', port: 1080, user: '', password: ''})
   }
-})
+}
+
+onMounted(loadTunnel)
+// /edit/:id 与 /edit 是同一条路由记录，组件会被复用、onMounted 不再触发，
+// 所以必须监听参数变化来重新加载表单。
+watch(() => route.params.id, loadTunnel)
 
 function addForward() {
   t.value.forwards = t.value.forwards || []
