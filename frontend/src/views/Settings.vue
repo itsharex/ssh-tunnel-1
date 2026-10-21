@@ -84,7 +84,7 @@ async function quitApp() {
       <label>配置文件路径</label>
       <div class="row">
         <input :value="configPath" readonly>
-        <button @click="openFolder" style="width:auto;">打开</button>
+        <button @click="openFolder" style="width:auto; flex:none;">打开</button>
       </div>
     </div>
   </div>
