@@ -43,6 +43,16 @@ async function toggle(t: Tunnel) {
   }
 }
 
+async function remove(t: Tunnel) {
+  const name = t.name || `${t.user}@${t.host}`
+  if (!window.confirm(`确定删除隧道「${name}」？删除后无法恢复。`)) return
+  try {
+    await store.remove(t.id)
+  } catch (e: any) {
+    alert('删除失败: ' + (e?.message || String(e)))
+  }
+}
+
 function edit(t: Tunnel) {
   router.push(`/edit/${t.id}`)
 }
@@ -134,7 +144,7 @@ const anyActive = computed(() =>
     <div class="actions">
       <button class="ghost" @click="exportSsh(t)" title="导出 SSH 命令" :disabled="exporting === t.id">⌘</button>
       <button class="ghost" @click="edit(t)" title="编辑">✎</button>
-      <button class="ghost danger" @click="store.remove(t.id)" title="删除">✕</button>
+      <button class="ghost danger" @click="remove(t)" title="删除">✕</button>
       <div class="toggle" :class="{on: t.status === 'running' || t.status === 'connecting', busy: busy === t.id}" @click="toggle(t)"></div>
     </div>
   </div>
