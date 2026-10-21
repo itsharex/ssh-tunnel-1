@@ -260,21 +260,23 @@ func (e *Entry) KillWith(r Reason) bool {
 // （采样只发生在页面打开时），期间的累计字节不能算进「当前速率」。
 const maxSampleGap = 3 * time.Second
 
-// sample 计算自上一样本以来的字节增量，写入速率字段。
-func (e *Entry) sample() { e.sampleAt(time.Now()) }
-
-// sampleAt 同 sample，但由调用方统一提供当前时刻——
+// sampleAt 计算自上一样本以来的字节增量并换算成每秒速率。
 // 一次采样要处理成百上千条记录，每条都调一次 time.Now() 纯属浪费
 // （500 条实测多花约 17µs）。
 //
 // 首轮与「停看过久」这两种情况只重建基准、速率归零：没有上一样本就算不出速率，
 // 把累计总量当成 1 秒的量会蹦出一个吓人的虚高值（重开监控页时最容易看到）。
+//
+// 增量要按实际间隔换算成「每秒」，不能直接当速率用：采样循环是
+// 「采样 → 序列化 → 推送 → 等 ticker」，间隔恒大于 1s；ticker 漏拍
+// （GC、休眠唤醒、前端卡顿）时两秒的增量若按一秒算，显示值就翻倍虚高。
 func (e *Entry) sampleAt(now time.Time) {
 	u := e.up.Load()
 	d := e.down.Load()
 
 	prev := e.lastAt.Swap(now.UnixNano())
-	if prev == 0 || now.Sub(time.Unix(0, prev)) > maxSampleGap {
+	elapsed := now.Sub(time.Unix(0, prev))
+	if prev == 0 || elapsed <= 0 || elapsed > maxSampleGap {
 		e.lastUp.Store(u)
 		e.lastDown.Store(d)
 		e.rateUp.Store(0)
@@ -282,8 +284,17 @@ func (e *Entry) sampleAt(now time.Time) {
 		return
 	}
 
-	e.rateUp.Store(u - e.lastUp.Swap(u))
-	e.rateDown.Store(d - e.lastDown.Swap(d))
+	e.rateUp.Store(perSecond(u-e.lastUp.Swap(u), elapsed))
+	e.rateDown.Store(perSecond(d-e.lastDown.Swap(d), elapsed))
+}
+
+// perSecond 把 elapsed 时间内的 delta 字节换算成每秒字节数。
+// delta 为负（计数被重置等异常）时按 0 处理，避免界面出现负数速率。
+func perSecond(delta int64, elapsed time.Duration) int64 {
+	if delta <= 0 || elapsed <= 0 {
+		return 0
+	}
+	return delta * int64(time.Second) / int64(elapsed)
 }
 
 // countedConn 包装连接：读记上行、写记下行。

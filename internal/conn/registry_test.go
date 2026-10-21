@@ -147,7 +147,9 @@ func TestRegistryCloseByTunnelMarksReason(t *testing.T) {
 	}
 }
 
-// TestEntryCounters 字节计数与速率采样
+// TestEntryCounters 字节计数与速率采样。
+// 采样时刻用 sampleAt 显式指定：速率按实际间隔换算成每秒，
+// 用真实的 time.Now() 连采两次（间隔几微秒）会把 30 字节放大成天文数字。
 func TestEntryCounters(t *testing.T) {
 	e := NewEntry("c1", "t1", "隧道", "L :1", "TCP", "127.0.0.1:1", "a:1")
 
@@ -160,24 +162,51 @@ func TestEntryCounters(t *testing.T) {
 		t.Fatalf("计数错误: up=%d down=%d", e.Up(), e.Down())
 	}
 
+	t0 := time.Now()
+
 	// 首轮只建立基准：没有上一样本就算不出速率，此时必须是 0 而不是累计值
-	e.sample()
+	e.sampleAt(t0)
 	if e.rateUp.Load() != 0 || e.rateDown.Load() != 0 {
 		t.Fatalf("首轮速率应为 0，实际 %d/%d", e.rateUp.Load(), e.rateDown.Load())
 	}
 
-	// 第二轮才有增量
+	// 第二轮才有增量，间隔恰好 1 秒，速率与增量数值相等
 	_, _ = rc.Read(make([]byte, 30))
 	_, _ = rc.Write(make([]byte, 10))
-	e.sample()
+	e.sampleAt(t0.Add(time.Second))
 	if e.rateUp.Load() != 30 || e.rateDown.Load() != 10 {
 		t.Fatalf("速率错误: %d/%d，期望 30/10", e.rateUp.Load(), e.rateDown.Load())
 	}
 
 	// 没有新流量时速率应归零
-	e.sample()
+	e.sampleAt(t0.Add(2 * time.Second))
 	if e.rateUp.Load() != 0 || e.rateDown.Load() != 0 {
 		t.Fatalf("空闲速率应为 0，实际 %d/%d", e.rateUp.Load(), e.rateDown.Load())
+	}
+}
+
+// TestRateNormalizedByElapsed 速率是「每秒字节数」，不是「每次采样的增量」。
+// 采样循环是「采样→序列化→推送→等 ticker」，间隔恒大于 1s；ticker 漏拍时
+// 两秒的增量若按一秒算，界面上的速率就会翻倍虚高。
+func TestRateNormalizedByElapsed(t *testing.T) {
+	e := NewEntry("c1", "t1", "隧道", "L :1", "TCP", "127.0.0.1:1", "a:1")
+	rc := e.Wrap(&fakeRW{})
+
+	t0 := time.Now()
+	e.sampleAt(t0)
+
+	// 2 秒内 1000 字节 = 500 B/s
+	_, _ = rc.Read(make([]byte, 1000))
+	e.sampleAt(t0.Add(2 * time.Second))
+	if e.rateUp.Load() != 500 {
+		t.Fatalf("2 秒 1000 字节应为 500 B/s，实际 %d", e.rateUp.Load())
+	}
+
+	// 半秒内 250 字节 = 500 B/s
+	_, _ = rc.Read(make([]byte, 250))
+	e.sampleAt(t0.Add(2500 * time.Millisecond))
+	if e.rateUp.Load() != 500 {
+		t.Fatalf("0.5 秒 250 字节应为 500 B/s，实际 %d", e.rateUp.Load())
 	}
 }
 
@@ -187,12 +216,12 @@ func TestSampleResetsAfterLongGap(t *testing.T) {
 	e := NewEntry("c1", "t1", "隧道", "L :1", "TCP", "127.0.0.1:1", "a:1")
 	rc := e.Wrap(&fakeRW{})
 
-	e.sample() // 建立基准
+	t0 := time.Now()
+	e.sampleAt(t0) // 建立基准
 	_, _ = rc.Read(make([]byte, 1<<20))
-	// 把上次采样时刻拨回一分钟前，模拟「页面关着、没人采样」
-	e.lastAt.Store(time.Now().Add(-time.Minute).UnixNano())
 
-	e.sample()
+	// 隔了一分钟才再次采样，等价于「页面关着、没人采样」
+	e.sampleAt(t0.Add(time.Minute))
 	if e.rateUp.Load() != 0 {
 		t.Fatalf("停看后首轮速率应为 0，实际 %d", e.rateUp.Load())
 	}
@@ -200,9 +229,9 @@ func TestSampleResetsAfterLongGap(t *testing.T) {
 		t.Fatalf("累计字节不应被重置，实际 %d", e.Up())
 	}
 
-	// 下一次采样恢复正常
+	// 下一次采样恢复正常：1 秒 50 字节
 	_, _ = rc.Read(make([]byte, 50))
-	e.sample()
+	e.sampleAt(t0.Add(time.Minute + time.Second))
 	if e.rateUp.Load() != 50 {
 		t.Fatalf("恢复后速率应为 50，实际 %d", e.rateUp.Load())
 	}
