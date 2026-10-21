@@ -1,0 +1,111 @@
+name: Test
+
+# 本项目是跨平台应用（macOS / Windows / Linux），任何变更都必须在三个平台上验证通过。
+# 该工作流在 push / PR 时跑全平台单测 + 编译，确保没有平台相关的编译错误或行为回归。
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test ${{ matrix.os }}
+    strategy:
+      fail-fast: false # 单个平台失败也要看到其它平台的结果
+      matrix:
+        include:
+          # Linux / macOS 跑竞态检测（-race 需要 cgo + C 工具链）
+          - os: ubuntu-22.04
+            race: true
+            cgo: '1'
+          - os: macos-14
+            race: true
+            cgo: '1'
+          # Windows 的 -race 依赖 mingw 工具链，稳定性一般，这里跑普通测试；
+          # 并发相关代码由 Linux/macOS 的 -race 覆盖。
+          # Windows 侧关掉 cgo，与本地交叉编译验证保持一致（Wails/systray 在 Windows 都是纯 Go）。
+          - os: windows-latest
+            race: false
+            cgo: '0'
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: ${{ matrix.cgo }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # 根包有 //go:embed all:frontend/dist，不先构建前端会导致 go build/go test 失败。
+      # 拆成两步避免 Windows runner 默认 shell(pwsh) 对 && 的差异。
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      # Wails v2 在 Linux 上依赖 webkit2gtk-4.0 / gtk3；libayatana-appindicator3-dev 是 systray 依赖
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libwebkit2gtk-4.0-dev \
+            libayatana-appindicator3-dev \
+            build-essential \
+            pkg-config
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race)
+        if: matrix.race
+        run: go test -race -count=1 ./...
+
+      - name: Test
+        if: ${{ !matrix.race }}
+        run: go test -count=1 ./...
+
+      - name: Build
+        run: go build ./...
+
+  frontend:
+    name: Frontend type-check & build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      # build 脚本内含 vue-tsc --noEmit，类型错误会在这里暴露
+      - name: Build
+        working-directory: frontend
+        run: npm run build
