@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"ssh-tunnel/internal/config"
+	"ssh-tunnel/internal/conn"
 )
 
 // Manager 管理所有隧道的运行时实例
@@ -11,6 +12,7 @@ type Manager struct {
 	mu       sync.RWMutex
 	tunnels  map[string]*Tunnel
 	store    *config.Store
+	reg      *conn.Registry
 	onStatus EventHandler
 }
 
@@ -19,9 +21,14 @@ func NewManager(store *config.Store, onStatus EventHandler) *Manager {
 	return &Manager{
 		tunnels:  make(map[string]*Tunnel),
 		store:    store,
+		reg:      conn.NewRegistry(),
 		onStatus: onStatus,
 	}
 }
+
+// Conns 返回全局连接登记表。所有隧道共用一个，
+// 这样界面上的「断开全部」能一次覆盖，进程表也只扫一遍。
+func (m *Manager) Conns() *conn.Registry { return m.reg }
 
 // ensure 确保隧道实例存在（按当前 store 中的配置创建）
 func (m *Manager) ensure(id string) (*Tunnel, error) {
@@ -35,6 +42,7 @@ func (m *Manager) ensure(id string) (*Tunnel, error) {
 		return nil, err
 	}
 	t := New(cfg, m.onStatus)
+	t.reg = m.reg
 	m.tunnels[id] = t
 	return t, nil
 }

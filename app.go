@@ -6,11 +6,16 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
+	"time"
 
 	"ssh-tunnel/internal/autostart"
 	"ssh-tunnel/internal/config"
+	"ssh-tunnel/internal/conn"
 	"ssh-tunnel/internal/dock"
 	"ssh-tunnel/internal/tunnel"
+
+	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // Version 程序版本号。本地开发时为 "dev"；
@@ -28,11 +33,14 @@ type AppInfo struct {
 
 // App 主应用，绑定到前端
 type App struct {
-	ctx        context.Context
-	store      *config.Store
-	manager    *tunnel.Manager
+	ctx         context.Context
+	store       *config.Store
+	manager     *tunnel.Manager
 	refreshTray func()
-	quitAppFn  func()
+	quitAppFn   func()
+
+	connMu   sync.Mutex
+	connStop chan struct{}
 }
 
 func NewApp(store *config.Store, manager *tunnel.Manager) *App {
@@ -53,6 +61,8 @@ func (a *App) refresh() {
 
 // quitApp 完全退出程序
 func (a *App) quitApp() {
+	// 先停掉推送协程，避免退出过程中还在序列化快照
+	a.ConnWatch(false)
 	if a.quitAppFn != nil {
 		a.quitAppFn()
 	}
@@ -116,6 +126,72 @@ func (a *App) TunnelStartAll() {
 // TunnelStopAll 停止所有隧道
 func (a *App) TunnelStopAll() {
 	a.manager.StopAll()
+}
+
+// --- 连接监控 ---
+
+// connPushInterval 连接列表推送间隔。1Hz 是刻意选的：
+// 再快前端也来不及渲染，而且每秒一次的全表序列化（500 行约 107µs）已经够用。
+const connPushInterval = time.Second
+
+// ConnList 返回当前所有连接快照
+func (a *App) ConnList() []conn.Snapshot {
+	return a.manager.Conns().Snapshot()
+}
+
+// ConnWatch 开关连接列表推送。
+// 前端进入连接页时开启、离开时关闭——用户不看的时候没必要每秒序列化整张表
+// 再推过 WebView 桥，那是这个功能唯一有实际成本的地方。
+func (a *App) ConnWatch(on bool) {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+
+	if !on {
+		if a.connStop != nil {
+			close(a.connStop)
+			a.connStop = nil
+		}
+		return
+	}
+	if a.connStop != nil {
+		return // 已经在推送
+	}
+	stop := make(chan struct{})
+	a.connStop = stop
+	go a.connPump(stop)
+}
+
+// connPump 每秒采样一次（算速率、清理过期记录、补进程信息）并推给前端
+func (a *App) connPump(stop <-chan struct{}) {
+	reg := a.manager.Conns()
+	ticker := time.NewTicker(connPushInterval)
+	defer ticker.Stop()
+	for {
+		reg.Sample()
+		if ctx := a.ctx; ctx != nil {
+			wailsRuntime.EventsEmit(ctx, "conn:update", reg.Snapshot())
+		}
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// ConnKill 断开单条连接
+func (a *App) ConnKill(id string) bool {
+	return a.manager.Conns().Kill(id)
+}
+
+// ConnKillAll 断开所有活跃连接，返回断开数量
+func (a *App) ConnKillAll() int {
+	return a.manager.Conns().KillAll()
+}
+
+// ConnKillByTunnel 断开某条隧道的所有连接，返回断开数量
+func (a *App) ConnKillByTunnel(tunnelID string) int {
+	return a.manager.Conns().KillByTunnel(tunnelID)
 }
 
 // --- 配置导入导出 ---

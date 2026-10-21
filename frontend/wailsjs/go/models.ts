@@ -123,6 +123,55 @@ export namespace config {
 
 }
 
+export namespace conn {
+	
+	export class Snapshot {
+	    id: string;
+	    tunnelId: string;
+	    tunnel: string;
+	    forward: string;
+	    proto: string;
+	    src: string;
+	    dst: string;
+	    pid: number;
+	    proc: string;
+	    state: string;
+	    reason: string;
+	    up: number;
+	    down: number;
+	    upRate: number;
+	    downRate: number;
+	    started: number;
+	    closedAt: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new Snapshot(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.tunnelId = source["tunnelId"];
+	        this.tunnel = source["tunnel"];
+	        this.forward = source["forward"];
+	        this.proto = source["proto"];
+	        this.src = source["src"];
+	        this.dst = source["dst"];
+	        this.pid = source["pid"];
+	        this.proc = source["proc"];
+	        this.state = source["state"];
+	        this.reason = source["reason"];
+	        this.up = source["up"];
+	        this.down = source["down"];
+	        this.upRate = source["upRate"];
+	        this.downRate = source["downRate"];
+	        this.started = source["started"];
+	        this.closedAt = source["closedAt"];
+	    }
+	}
+
+}
+
 export namespace main {
 	
 	export class AppInfo {

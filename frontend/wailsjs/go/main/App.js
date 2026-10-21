@@ -6,6 +6,26 @@ export function ConfigPath() {
   return window['go']['main']['App']['ConfigPath']();
 }
 
+export function ConnKill(arg1) {
+  return window['go']['main']['App']['ConnKill'](arg1);
+}
+
+export function ConnKillAll() {
+  return window['go']['main']['App']['ConnKillAll']();
+}
+
+export function ConnKillByTunnel(arg1) {
+  return window['go']['main']['App']['ConnKillByTunnel'](arg1);
+}
+
+export function ConnList() {
+  return window['go']['main']['App']['ConnList']();
+}
+
+export function ConnWatch(arg1) {
+  return window['go']['main']['App']['ConnWatch'](arg1);
+}
+
 export function ExportConfig() {
   return window['go']['main']['App']['ExportConfig']();
 }

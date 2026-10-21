@@ -9,9 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/ssh"
 	"ssh-tunnel/internal/auth"
 	"ssh-tunnel/internal/config"
-	"golang.org/x/crypto/ssh"
+	"ssh-tunnel/internal/conn"
 )
 
 // EventHandler 隧道状态变更回调（用于向 Wails 前端推送事件）
@@ -19,22 +20,25 @@ type EventHandler func(tunnelID string, status config.Status, lastError string)
 
 // Tunnel 单条隧道的运行时实例
 type Tunnel struct {
-	cfg      config.Tunnel
-	mu       sync.Mutex
-	client   *ssh.Client
-	stopCh   chan struct{}
-	doneCh   chan struct{}
+	id        string
+	cfg       config.Tunnel
+	mu        sync.Mutex
+	client    *ssh.Client
+	stopCh    chan struct{}
+	doneCh    chan struct{}
 	listeners []net.Listener
-	status   config.Status
-	lastErr  string
+	status    config.Status
+	lastErr   string
 	startedAt time.Time
+
+	reg *conn.Registry // 连接登记表，可为 nil（未启用监控）
 
 	onStatus EventHandler
 }
 
 // New 用配置创建一个 Tunnel 实例（不启动）
 func New(c config.Tunnel, h EventHandler) *Tunnel {
-	return &Tunnel{cfg: c, onStatus: h}
+	return &Tunnel{id: c.ID, cfg: c, onStatus: h}
 }
 
 // Cfg 返回当前配置快照
@@ -367,15 +371,19 @@ func (t *Tunnel) startForwards(client *ssh.Client, cfg config.Tunnel) error {
 	t.mu.Lock()
 	t.listeners = t.listeners[:0]
 	t.mu.Unlock()
+
+	meta := connMeta{id: cfg.ID, name: displayName(cfg)}
 	for _, f := range cfg.Forwards {
-		if err := t.startOneForward(client, f); err != nil {
+		if err := t.startOneForward(client, f, meta); err != nil {
 			return fmt.Errorf("转发 %s %s 启动失败: %w", f.Type, f.Listen, err)
 		}
 	}
 	return nil
 }
 
-// closeAll 关闭所有监听器
+// closeAll 关闭所有监听器，并清理本隧道的连接记录。
+// 监听器关掉只是不再接受新连接，已经建立的在 ssh 客户端关闭后才会自然结束；
+// 这里主动清理一遍，避免界面上残留一批永远不会更新的「活跃」记录。
 func (t *Tunnel) closeAll() {
 	t.mu.Lock()
 	ls := t.listeners
@@ -383,6 +391,9 @@ func (t *Tunnel) closeAll() {
 	t.mu.Unlock()
 	for _, l := range ls {
 		_ = l.Close()
+	}
+	if t.reg != nil {
+		t.reg.CloseByTunnel(t.id)
 	}
 }
 

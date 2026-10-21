@@ -29,6 +29,7 @@ async function quitApp() {
       <div class="logo">SSH Tunnel</div>
       <nav>
         <router-link to="/">隧道列表</router-link>
+        <router-link to="/connections">连接监控</router-link>
         <router-link to="/edit">新建隧道</router-link>
         <router-link to="/import">导入导出</router-link>
         <router-link to="/settings">设置</router-link>
