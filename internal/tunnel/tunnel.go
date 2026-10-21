@@ -54,9 +54,9 @@ func (t *Tunnel) Status() (config.Status, string, time.Time) {
 func (t *Tunnel) setStatus(s config.Status, err string) {
 	t.mu.Lock()
 	t.status = s
-	if err != "" || s == config.StatusRunning || s == config.StatusConnecting {
-		t.lastErr = err
-	}
+	// 与 Store.UpdateRuntimeStatus 保持一致：状态与错误信息总是成对更新，
+	// 避免「UI 已清空错误、托盘还留着旧错误」的不一致。
+	t.lastErr = err
 	if s == config.StatusRunning || s == config.StatusConnecting {
 		if t.startedAt.IsZero() {
 			t.startedAt = time.Now()
@@ -114,6 +114,10 @@ func (t *Tunnel) Stop() {
 
 // run 主循环：连接 → 启动转发 → 监控断线 → 退避重连
 func (t *Tunnel) run() {
+	// stopCh 在本次 run 的生命周期内不会变化（Stop 只 close 不替换），
+	// 捕获到局部变量后各 goroutine 都不必再读 t.stopCh 字段，避免数据竞争。
+	stopCh := t.stopSignal()
+
 	// errored 标记本次退出是否因终态错误（无自动重连时的连接失败 / 断开）。
 	// 若是，保留 Error 状态，不 defer 覆盖为 Stopped，让用户能看到 ⚠。
 	var errored bool
@@ -142,7 +146,7 @@ func (t *Tunnel) run() {
 
 	for {
 		select {
-		case <-t.stopCh:
+		case <-stopCh:
 			return
 		default:
 		}
@@ -153,11 +157,11 @@ func (t *Tunnel) run() {
 		cfg := t.Cfg()
 
 		t.setStatus(config.StatusConnecting, "")
-		client, err := t.connect(cfg)
+		client, err := t.connect(cfg, stopCh)
 		if err != nil {
 			// 若是停止导致的中断，不报错
 			select {
-			case <-t.stopCh:
+			case <-stopCh:
 				return
 			default:
 			}
@@ -166,7 +170,7 @@ func (t *Tunnel) run() {
 				errored = true
 				return
 			}
-			if !t.sleep(time.Duration(backoff) * time.Millisecond) {
+			if !t.sleep(time.Duration(backoff)*time.Millisecond, stopCh) {
 				return
 			}
 			backoff = backoff * 2
@@ -190,7 +194,7 @@ func (t *Tunnel) run() {
 				errored = true
 				return
 			}
-			if !t.sleep(time.Duration(backoff) * time.Millisecond) {
+			if !t.sleep(time.Duration(backoff)*time.Millisecond, stopCh) {
 				return
 			}
 			backoff = backoff * 2
@@ -217,7 +221,7 @@ func (t *Tunnel) run() {
 		waitErr := make(chan error, 1)
 		go func() { waitErr <- client.Wait() }()
 		select {
-		case <-t.stopCh:
+		case <-stopCh:
 			close(kaDone)
 			t.closeAll()
 			_ = client.Close()
@@ -235,7 +239,7 @@ func (t *Tunnel) run() {
 				return
 			}
 			t.setStatus(config.StatusConnecting, "连接断开，准备重连")
-			if !t.sleep(time.Duration(backoff) * time.Millisecond) {
+			if !t.sleep(time.Duration(backoff)*time.Millisecond, stopCh) {
 				return
 			}
 			backoff = backoff * 2
@@ -246,9 +250,14 @@ func (t *Tunnel) run() {
 	}
 }
 
-// connect 建立 SSH 连接。使用 context 监听 stopCh，使 Stop 时能立即中断拨号。
+// handshakeTimeout SSH 握手超时。注意 ssh.ClientConfig.Timeout 只在 ssh.Dial
+// 内部生效，本实现用 ssh.NewClientConn 自己握手，必须显式给连接设 deadline，
+// 否则对端只 accept 却不发 banner（端口填错、防火墙黑洞）时会永久阻塞。
+const handshakeTimeout = 15 * time.Second
+
+// connect 建立 SSH 连接。stopCh 用于在 Stop 时立即中断拨号与握手。
 // 配置由调用方以快照传入，避免与 Manager 的并发写 t.cfg 竞争。
-func (t *Tunnel) connect(cfg config.Tunnel) (*ssh.Client, error) {
+func (t *Tunnel) connect(cfg config.Tunnel, stopCh <-chan struct{}) (*ssh.Client, error) {
 	authMethods, err := auth.BuildAuthMethods(string(cfg.AuthType), cfg.Password, cfg.KeyPath, cfg.KeyPassphrase)
 	if err != nil {
 		return nil, fmt.Errorf("认证配置错误: %w", err)
@@ -261,44 +270,65 @@ func (t *Tunnel) connect(cfg config.Tunnel) (*ssh.Client, error) {
 		User:            cfg.User,
 		Auth:            authMethods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // 简化：不校验 host key，管理工具常见做法
-		Timeout:         15 * time.Second,
+		Timeout:         handshakeTimeout,
 	}
 	addr := fmt.Sprintf("%s:%d", cfg.Host, port)
 
-	// 用 context 让 TCP 拨号可被 stopCh 中断
+	// 拨号阶段：用 context 让 TCP 拨号可被 stopCh 中断
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	stopWatcherDone := make(chan struct{})
+	dialDone := make(chan struct{})
 	go func() {
 		select {
-		case <-t.stopCh:
+		case <-stopCh:
 			cancel()
-		case <-stopWatcherDone:
+		case <-dialDone:
 		}
 	}()
-	defer close(stopWatcherDone)
 
 	conn, err := dialViaProxy(ctx, cfg.Proxy, addr)
+	close(dialDone)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, errors.New("已取消")
 		}
 		return nil, fmt.Errorf("连接 %s 失败: %w", addr, err)
 	}
-	// 握手阶段若被取消则关闭连接
+
+	// 握手阶段：stopCh 触发时直接关闭底层连接打断 NewClientConn
+	handshakeDone := make(chan struct{})
+	go func() {
+		select {
+		case <-stopCh:
+			_ = conn.Close()
+		case <-handshakeDone:
+		}
+	}()
+	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 	sc, chans, reqs, err := ssh.NewClientConn(conn, addr, sshCfg)
+	close(handshakeDone)
 	if err != nil {
 		_ = conn.Close()
-		if ctx.Err() != nil {
+		select {
+		case <-stopCh:
 			return nil, errors.New("已取消")
+		default:
 		}
 		return nil, fmt.Errorf("握手 %s 失败: %w", addr, err)
 	}
+	// 握手完成，清掉 deadline，否则长连接会在 15s 后被判超时断开
+	_ = conn.SetDeadline(time.Time{})
 	return ssh.NewClient(sc, chans, reqs), nil
 }
 
+// keepaliveTimeout 单次 keepalive 的等待上限。
+// client.SendRequest(wantReply=true) 在链路「静默死亡」（NAT 表项过期、
+// 中间设备丢包但不发 RST）时不会返回错误，而是一直阻塞；因此必须自己加超时，
+// 超时即认定连接已死，关闭客户端让 client.Wait() 返回以触发重连。
+const keepaliveTimeout = 10 * time.Second
+
 // keepalive 周期性向 SSH 服务器发送 keepalive 请求，保持长连接活跃。
-// 在 done 关闭或 SendRequest 失败（连接已断）时退出。
+// 在 done 关闭、请求失败或超时时退出。
 func (t *Tunnel) keepalive(client *ssh.Client, intervalSec int, done <-chan struct{}) {
 	interval := time.Duration(intervalSec) * time.Second
 	if interval <= 0 {
@@ -311,9 +341,21 @@ func (t *Tunnel) keepalive(client *ssh.Client, intervalSec int, done <-chan stru
 		case <-done:
 			return
 		case <-ticker.C:
-			// wantReply=true 让服务器必须回应，从而确认连接存活；
-			// 连接已断时 SendRequest 返回错误，退出 goroutine
-			if _, _, err := client.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+			res := make(chan error, 1)
+			go func() {
+				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+				res <- err
+			}()
+			select {
+			case <-done:
+				return
+			case err := <-res:
+				if err != nil {
+					return
+				}
+			case <-time.After(keepaliveTimeout):
+				// 心跳无响应：主动断开，交由上层重连
+				_ = client.Close()
 				return
 			}
 		}
@@ -345,16 +387,25 @@ func (t *Tunnel) closeAll() {
 }
 
 // sleep 可被停止信号打断的 sleep
-func (t *Tunnel) sleep(d time.Duration) bool {
+func (t *Tunnel) sleep(d time.Duration, stopCh <-chan struct{}) bool {
 	if d <= 0 {
 		return true
 	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
 	select {
-	case <-t.stopCh:
+	case <-stopCh:
 		return false
-	case <-time.After(d):
+	case <-timer.C:
 		return true
 	}
+}
+
+// stopSignal 返回当前停止信号通道（加锁读取，避免与 run 退出时把字段置 nil 竞争）
+func (t *Tunnel) stopSignal() <-chan struct{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stopCh
 }
 
 // normalizeAddr 规范化监听地址，缺少 host 时默认 127.0.0.1
