@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"strings"
 )
 
@@ -23,7 +24,7 @@ func ToSSHCommand(t Tunnel) string {
 	}
 
 	if t.AuthType == AuthKey && t.KeyPath != "" {
-		parts = append(parts, "-i", t.KeyPath)
+		parts = append(parts, "-i", shellQuote(t.KeyPath))
 	}
 
 	if t.Port != 0 && t.Port != 22 {
@@ -60,9 +61,33 @@ func forwardRemoteArg(f Forward) string {
 }
 
 func splitHostPort(addr string) (host, port string) {
+	if h, p, err := net.SplitHostPort(addr); err == nil {
+		// net.SplitHostPort 会剥掉 IPv6 的方括号，这里还原成 ssh 需要的 [::1] 形式，
+		// 否则 "::1:8080" 这种输出会被 ssh 当成非法参数。
+		if strings.Contains(h, ":") {
+			h = "[" + h + "]"
+		}
+		return h, p
+	}
+	// 兼容两种非标准写法：省略 host 的简写（"8080"）和没加方括号的 IPv6（"::1:8080"）
 	idx := strings.LastIndex(addr, ":")
 	if idx < 0 {
 		return "", addr
 	}
-	return addr[:idx], addr[idx+1:]
+	h, p := addr[:idx], addr[idx+1:]
+	if strings.Contains(h, ":") {
+		h = "[" + h + "]"
+	}
+	return h, p
+}
+
+// shellQuote 仅在参数含 shell 特殊字符时加单引号，
+// 避免密钥路径里有空格时导出的命令不可用。
+// 注意不能把 ~ 当作特殊字符：单引号内的 ~ 不会被 shell 展开，
+// 会把 ~/.ssh/id_rsa 变成字面量路径。
+func shellQuote(s string) string {
+	if s == "" || !strings.ContainsAny(s, " \t\"'\\$&|;<>()*?[]{}!`") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
